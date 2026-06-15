@@ -8,6 +8,7 @@ provides array of draft keys with timeout logic.
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +16,16 @@ from typing import Optional
 
 AUTH_PATH = Path.home() / ".hermes" / "auth.json"
 AGENT_TIMEOUT = 600  # seconds
+
+# Context limits per provider/model (conservative estimates)
+CONTEXT_LIMITS = {
+    "zai": {"glm-5": 128_000, "glm-4": 128_000, "glm-4.5": 128_000, "default": 128_000},
+    "copilot": {"gpt-4o": 128_000, "gpt-4o-mini": 128_000, "gpt-4": 128_000, "default": 128_000},
+    "minimax": {"minimax-01": 256_000, "abab-6.5s": 256_000, "default": 256_000},
+    "openai-codex": {"gpt-5": 272_000, "gpt-4o": 128_000, "default": 272_000},
+    "nous": {"hermes-3-70b": 256_000, "hermes-3-8b": 256_000, "default": 256_000},
+    "nvidia": {"nemotron-3-ultra": 128_000, "default": 128_000},
+}
 
 
 @dataclass
@@ -25,11 +36,21 @@ class KeyState:
     model: str = ""
     last_used: int = 0
     status: str = "draft"  # draft, exhausted, dead
+    context_limit: int = 0
+
+    def effective_context(self) -> int:
+        """Get effective context limit for this key's model."""
+        if self.context_limit:
+            return self.context_limit
+        provider_limits = CONTEXT_LIMITS.get(self.provider, {})
+        if self.model:
+            return provider_limits.get(self.model, provider_limits.get("default", 128_000))
+        return provider_limits.get("default", 128_000)
 
 
 @dataclass
 class Chimera:
-    """Observable key->model array."""
+    """Observable key->model array with context-aware routing."""
     
     keys: list[KeyState] = field(default_factory=list)
     _loaded_at: int = 0
@@ -40,7 +61,12 @@ class Chimera:
             self.keys = []
             return
             
-        pool = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+        try:
+            pool = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            self.keys = []
+            return
+            
         cred_pool = pool.get("credential_pool", {})
         
         self.keys.clear()
@@ -71,15 +97,26 @@ class Chimera:
                     # Key timed out, treat as available
                     last_used = 0
                 
+                model = cred.get("last_model", "")
+                ctx_limit = self._get_context_limit(provider, model)
+                
                 self.keys.append(KeyState(
                     id=key_id,
                     provider=provider,
-                    model=cred.get("last_model", ""),
+                    model=model,
                     last_used=last_used,
                     status=last_status,
+                    context_limit=ctx_limit,
                 ))
         
         self._loaded_at = int(now)
+    
+    def _get_context_limit(self, provider: str, model: str) -> int:
+        """Get context limit for provider/model."""
+        provider_limits = CONTEXT_LIMITS.get(provider, {})
+        if model:
+            return provider_limits.get(model, provider_limits.get("default", 128_000))
+        return provider_limits.get("default", 128_000)
     
     def drafts(self) -> list[KeyState]:
         """Get all draft keys."""
@@ -105,10 +142,17 @@ class Chimera:
             if k.id == key_id:
                 k.last_used = now
                 k.model = model
+                k.context_limit = self._get_context_limit(k.provider, model)
                 break
         
         # Persist to auth.json
-        pool = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+        if not AUTH_PATH.exists():
+            return
+        try:
+            pool = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return
+            
         for provider, creds in pool.get("credential_pool", {}).items():
             if not isinstance(creds, list):
                 continue
@@ -118,7 +162,10 @@ class Chimera:
                     cred["last_used_at"] = now
                     break
         
-        AUTH_PATH.write_text(json.dumps(pool, indent=2), encoding="utf-8")
+        try:
+            AUTH_PATH.write_text(json.dumps(pool, indent=2), encoding="utf-8")
+        except OSError:
+            pass
     
     def most_recent(self) -> Optional[KeyState]:
         """Most recently used draft key."""
@@ -138,6 +185,28 @@ class Chimera:
             return min(used, key=lambda k: k.last_used)
         # All fresh, return any
         return candidates[0]
+    
+    def least_context(self) -> Optional[KeyState]:
+        """Key with smallest context limit (least common denominator)."""
+        candidates = self.drafts()
+        if not candidates:
+            return None
+        return min(candidates, key=lambda k: k.effective_context())
+    
+    def virtual_llm(self) -> dict:
+        """Virtual LLM config: min context across all draft keys."""
+        candidates = self.drafts()
+        if not candidates:
+            return {}
+        min_ctx = min(k.effective_context() for k in candidates)
+        # Return config with min context - any key can handle this
+        key = self.least_context()
+        return {
+            "provider": key.provider,
+            "model": key.model or "auto",
+            "context_limit": min_ctx,  # MINIMUM across all draft keys
+            "key_id": key.id,
+        }
 
 
 # Singleton instance
@@ -179,7 +248,6 @@ def takeover() -> None:
         "kanban.max_spawn": drafts,
     }
     
-    import subprocess
     for key, value in config.items():
         subprocess.run(
             ["hermes", "config", "set", key, str(value)],
