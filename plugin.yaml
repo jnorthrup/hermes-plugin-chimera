@@ -1,0 +1,13 @@
+name: chimera
+version: 0.1.0
+description: Observable key->model array for Hermes draft tracking
+author: TrikeShed
+license: MIT
+keywords:
+  - chimera
+  - key-pool
+  - draft
+
+kind: backend
+
+entry_point: __init__
